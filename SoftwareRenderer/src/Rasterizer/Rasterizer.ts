@@ -1,21 +1,148 @@
-import {Buffer} from "../Buffer.ts";
+import {Buffer, Float64Buffer} from "../Buffer.ts";
 import {Shader} from "../Shader.ts";
 import {Mesh} from "./Mesh.ts";
 import {Vector} from "../Math/Vector.ts";
 import {Camera} from "./Camera.ts";
+import createModule from "../WasmBindings/renderer.mjs";
+import type {EmbindModule, MainModule} from "../WasmBindings/renderer.d.ts"
+import MainModuleFactory from "../WasmBindings/renderer.mjs";
 
 export class Rasterizer {
     width: number
     height: number
     renderBuffer: Buffer
-    depthBuffer: Buffer
+    depthBuffer: Float64Buffer
+    renderBufferPointer: number | null = null;
+    depthBufferPointer: number | null = null;
+    module: MainModule | null
 
     constructor(width: number, height: number) {
         this.width = width
         this.height = height
 
         this.renderBuffer = new Buffer(width, height, 4)
-        this.depthBuffer = new Buffer(width, height, 1)
+        this.depthBuffer = new Float64Buffer(width, height, 1)
+
+        this.module = null // only gets a value when webassembly is initialized
+    }
+
+    renderWasm(mesh: Mesh, camera: Camera, globals: Float64Array[]) {
+        if (!this.module) {
+            throw new Error("You must call initializeWasm before renderWasm");
+        }
+
+        if (!this.renderBufferPointer) {
+            throw new Error("You must call createBufferPointers before renderWasm");
+        }
+
+        // same setup as normal render
+        let vertices = camera.transformVertices(mesh.vertices);
+        const faces = mesh.faces;
+        let vertexAttributes = mesh.vertexAttributes;
+        let meshFaceAttributes: Float64Array[][] = mesh.faceAttributes;
+
+        const clippedScene = camera.clipVertices(vertices, faces, vertexAttributes, meshFaceAttributes, camera.fov);
+        const clippedVertices = clippedScene.vertices;
+        const clippedFaces = clippedScene.faces;
+        vertexAttributes = clippedScene.vertexAttributes;
+        meshFaceAttributes = clippedScene.faceAttributes;
+        const transformedVertices = camera.projectVertices(clippedVertices);
+
+        if (!clippedVertices.length) {
+            return; // nothing to render
+        }
+
+        for (let a in vertexAttributes) {
+            for (let v in clippedVertices) {
+                const vertex = clippedVertices[v]
+
+                let attribute = vertexAttributes[a][v];
+                for (let element = 0; element < attribute.length; element++) {
+                    attribute[element] /= vertex[2];
+                }
+            }
+        }
+
+        for (let i in clippedFaces) { 
+            const face = clippedFaces[i];
+
+            const worldVertices: Float64Array = new Float64Array([
+                ...clippedVertices[face[0]],
+                ...clippedVertices[face[1]],
+                ...clippedVertices[face[2]],
+            ]);
+
+            const faceTransformedVertices = new Float64Array([
+                ...transformedVertices[face[0]],
+                ...transformedVertices[face[1]],
+                ...transformedVertices[face[2]],
+            ])
+
+            let faceVertexAttributes: Float64Array[] = new Array(3);
+            // flatten vertex attributes into a list of all attributes one after another per vertex
+            for (let vertex = 0; vertex < 3; vertex++) {
+                let attributeList: number[] = [];
+                for (let attribute of vertexAttributes) {
+                    attributeList.push(...attribute[face[vertex]]);
+                }
+                faceVertexAttributes[vertex] = new Float64Array(attributeList);
+            }
+
+            let faceVertexAttributesPointers = new Int32Array(3);
+            for (let vertex in faceVertexAttributes) {
+                faceVertexAttributesPointers[vertex] = this.float64ArrayToPointer(faceVertexAttributes[vertex]);
+            }
+
+            // let elements: number[] = [];
+            // for (let global of globals) {
+            //     elements.push(...global);
+            // }
+            // let globalAttributesPointer = this.float64ArrayToPointer(new Float64Array(elements));
+
+            let faceAttributesForFace: Float64Array;
+            let elements = []
+            for (let attribute in meshFaceAttributes) {
+                elements.push(...meshFaceAttributes[attribute][i])
+            }
+            faceAttributesForFace = new Float64Array(elements);
+
+            const worldVerticesPtr = this.float64ArrayToPointer(worldVertices); // always has 9 entries xyz for each vertex
+            const faceTransformedVerticesPtr = this.float64ArrayToPointer(faceTransformedVertices); // always has 9 entries xyz for each vertex
+            const faceAttributesPtr = this.float64ArrayToPointer(faceAttributesForFace);
+            const faceVertexAttributesDoublePtr =  this.int32ArrayToPointer(faceVertexAttributesPointers);
+
+            const numFaceAttributes = meshFaceAttributes.length; // we don't care about the size, that should be known by the developer in the shader so we only pass the number of attributes
+            const vertexAttributeSize = faceVertexAttributes[0].length; // 2d array alway has 3 rows so we only need column sizes
+
+            let shaderName = "test";
+            this.module!.render(
+                this.renderBufferPointer!,
+                this.depthBufferPointer!, 
+                this.width, 
+                this.height,
+                worldVerticesPtr,
+                faceTransformedVerticesPtr,
+                faceAttributesPtr,
+                numFaceAttributes,
+                faceVertexAttributesDoublePtr,
+                vertexAttributeSize,
+                0,
+                shaderName
+            )
+
+            this.renderBuffer.values = this.pointerToUint8ClampedArray(this.renderBufferPointer, this.renderBuffer.values.length);
+            this.depthBuffer.values = this.pointerToFloat64Array(this.depthBufferPointer!, this.depthBuffer.values.length);
+
+            // free memory we have allocated to avoid memory leak
+            this.freePointer(worldVerticesPtr);
+            this.freePointer(faceTransformedVerticesPtr);
+            this.freePointer(faceAttributesPtr);
+            for (let vertex in faceVertexAttributes) {
+                this.freePointer(faceVertexAttributesPointers[vertex]);
+            }
+            // this.freePointer(globalAttributesPointer);
+            this.freePointer(faceVertexAttributesDoublePtr);
+        }
     }
 
     /*
@@ -25,33 +152,34 @@ export class Rasterizer {
     render(mesh: Mesh, camera: Camera, shader: Shader) {
         let vertices = camera.transformVertices(mesh.vertices);
         const faces = mesh.faces;
-        const vertexAttributes = mesh.vertexAttributes;
-        const meshFaceAttributes: Float64Array[][] = mesh.faceAttributes;
-        const aspectRatio = this.width / this.height;
+        let vertexAttributes = mesh.vertexAttributes;
+        let meshFaceAttributes: Float64Array[][] = mesh.faceAttributes;
 
         // converts world to screen coordinates
         const worldToScreen = (vertex: Vector): Vector => {
             let res: Vector = [0, 0, 0];
-            res[0] = (vertex[0] + 1) / 2 * this.width / aspectRatio;
+            res[0] = (vertex[0] + 1) / 2 * this.width;
             res[1] = (vertex[1] + 1) / 2 * this.height;
 
             return res;
         }
 
         // converts screen to world coordinates
-        const screenToWorld = (vertex: Vector): Vector => {
-            let res: Vector = [0, 0, 0];
-            res[0] = vertex[0] / this.width * 2 * aspectRatio - 1;
-            res[1] = vertex[1] / this.height * 2 - 1;
-
-            return res
+        const screenToWorld = (vertex: Vector) => {
+            vertex[0] = vertex[0] / this.width * 2 - 1;
+            vertex[1] = vertex[1] / this.height * 2 - 1;
         }
 
-        const transformedVertices = camera.projectVertices(vertices);
+        const clippedScene = camera.clipVertices(vertices, faces, vertexAttributes, meshFaceAttributes, camera.fov);
+        const clippedVertices = clippedScene.vertices;
+        const clippedFaces = clippedScene.faces;
+        vertexAttributes = clippedScene.vertexAttributes;
+        meshFaceAttributes = clippedScene.faceAttributes;
+        const transformedVertices = camera.projectVertices(clippedVertices);
 
         for (let a in vertexAttributes) {
-            for (let v in vertices) {
-                const vertex = vertices[v]
+            for (let v in clippedVertices) {
+                const vertex = clippedVertices[v]
 
                 let attribute = vertexAttributes[a][v];
                 for (let element = 0; element < attribute.length; element++) {
@@ -60,14 +188,14 @@ export class Rasterizer {
             }
         }
 
-        for (let i in faces) {
-            const face = faces[i];
+        for (let i in clippedFaces) {
+            const face: Vector = clippedFaces[i] as Vector;
             let faceAttributes: Float64Array[] = [];
 
             // the world position of vertices
-            const worldA = vertices[face[0]];
-            const worldB = vertices[face[1]];
-            const worldC = vertices[face[2]];
+            const worldA = clippedVertices[face[0]];
+            const worldB = clippedVertices[face[1]];
+            const worldC = clippedVertices[face[2]];
 
             // used for interpolating x and y positions per pixel
             const interpolateVertexA = [...worldA]
@@ -100,7 +228,7 @@ export class Rasterizer {
             // the area of the projected triangle, useful for vertex attributes and z
             const area = Math.abs(this.edgeFunction(vertexA, vertexB, vertexC));
 
-            let color = new Float64Array(4); // also created here for performance
+            let color = new Uint8ClampedArray(4); // also created here for performance
             let pixelVertexAttributes: Float64Array[] = [];
 
             // [vertexAttribute][vertex]
@@ -126,11 +254,18 @@ export class Rasterizer {
             br[0] = Math.min(br[0], this.width);
             br[1] = Math.min(br[1], this.height);
 
+            let depth: Float64Array = new Float64Array([0]);
+            let ws = [0, 0, 0];
+            let shaderCoordinates: Vector = [0, 0, 0];
+            let worldCoords: Vector = [0, 0, 0]
+
             for (let y = tl[1]; y < br[1]; y++) {
                 for (let x = tl[0]; x < br[0]; x++) {
-                    const worldCoords: Vector = screenToWorld([x, y, 0])
-                    if (!this.triangleContains(worldCoords, vertexA, vertexB, vertexC)) continue;
+                    worldCoords[0] = x;
+                    worldCoords[1] = y;
+                    screenToWorld(worldCoords)
                     if (x < 0 || y < 0 || x >= this.width || y >= this.height) continue;
+                    if (!this.triangleContains(worldCoords, vertexA, vertexB, vertexC)) continue;
 
                     // each of these is the area between two of the vertices and the current pixel, it is used as
                     // a measure of how much a given vertex effects the z or a vertex attribute
@@ -146,20 +281,27 @@ export class Rasterizer {
                     wc = Math.abs(wc);
 
                     const z = 1 / (wa * inverseZA + wb * inverseZB + wc * inverseZC); // interpolate z
-                    const previousDepth = this.depthBuffer.getElement(x, y)[0]
+                    this.depthBuffer.getSingleElement(x, y, depth);
+
                     // if the current pixel is obscured by a closer pixel, don't render it
-                    if (z > previousDepth || z < 0) continue;
-                    this.depthBuffer.setElement(x, y, new Float64Array([z]))
+                    if (z > depth[0] || z < 0) continue;
+                    depth[0] = z;
+                    this.depthBuffer.setSingleElement(x, y, depth[0])
 
                     // apply perspective to vertex attributes
-                    const ws = [wa, wb, wc];
+                    ws[0] = wa;
+                    ws[1] = wb;
+                    ws[2] = wc;
                     this.interpolateVertexAttributes(faceVertexAttributes, pixelVertexAttributes, ws, z);
 
                     // calculate x and y of pixel
                     const worldX = (interpolateVertexA[0] * wa + interpolateVertexB[0] * wb + interpolateVertexC[0] * wc) * z;
                     const worldY = (interpolateVertexA[1] * wa + interpolateVertexB[1] * wb + interpolateVertexC[1] * wc) * z;
 
-                    shader(color, [worldX, worldY, z], faceAttributes, pixelVertexAttributes, mesh.globals);
+                    shaderCoordinates[0] = worldX;
+                    shaderCoordinates[1] = worldY;
+                    shaderCoordinates[2] = z;
+                    shader(color, shaderCoordinates, faceAttributes, pixelVertexAttributes, mesh.globals);
                     this.renderBuffer.setElement(x, y, color);
                 }
             }
@@ -168,13 +310,16 @@ export class Rasterizer {
 
     // takes all the face vertex attributes, interpolates between them based off pixel location (ws) and z and writes it to pixelVertexAttributes
     interpolateVertexAttributes(faceVertexAttributes: Float64Array[][], pixelVertexAttributes: Float64Array[], ws: number[], z: number) {
-        for (let i = 0; i < pixelVertexAttributes.length; i++) {
+        let numPixelVertexAttributes = pixelVertexAttributes.length;
+        for (let i = 0; i < numPixelVertexAttributes; i++) {
             let attribute = pixelVertexAttributes[i]
-            for (let element in attribute) attribute[element] = 0;
 
-            for (let vertex = 0; vertex < 3; vertex++) {
-                for (let element in attribute) {
-                    attribute[element] += faceVertexAttributes[i][vertex][element] * ws[element] * z;
+            const numElements = attribute.length;
+
+            for (let element = 0; element < numElements; element++) {
+                attribute[element] = 0;
+                for (let vertex = 0; vertex < 3; vertex++) {
+                    attribute[element] += faceVertexAttributes[i][vertex][element] * ws[vertex] * z;
                 }
             }
         }
@@ -245,7 +390,70 @@ export class Rasterizer {
     Clears the render buffer to 0s and the depth buffer to -1
      */
     clear() {
-        this.renderBuffer.clear(0)
-        this.depthBuffer.clear(Number.MAX_VALUE)
+        this.renderBuffer.clear(30)
+        this.depthBuffer.clear(255)
+    }
+
+    float64ArrayToPointer(arr: Float64Array) {
+        const ptr = this.module!._malloc(arr.length * arr.BYTES_PER_ELEMENT);
+        this.module!.HEAPF64.set(arr, ptr / 8);
+        return ptr;
+    }
+
+    uint8ArrayToPointer(arr: Uint8ClampedArray) {
+        const ptr = this.module!._malloc(arr.length * arr.BYTES_PER_ELEMENT);
+        this.module!.HEAPU8.set(arr, ptr);
+        return ptr;
+    }
+
+    int32ArrayToPointer(arr: Int32Array) {
+        const ptr = this.module!._malloc(arr.length * arr.BYTES_PER_ELEMENT);
+        this.module!.HEAP32.set(arr, ptr / 4);
+        return ptr;
+    }
+
+    pointerToUint8ClampedArray(ptr: number, length: number) {
+        const memoryBuffer = this.module!.HEAPU8.buffer;
+        return new Uint8ClampedArray(memoryBuffer, ptr, length);
+    }
+
+    pointerToFloat64Array(ptr: number, length: number) {
+        const memoryBuffer = this.module!.HEAPF64.buffer;
+        const bufferAsFloatArray = new Float64Array(memoryBuffer, ptr, length);
+        return bufferAsFloatArray;
+    }
+
+    freePointer(ptr: number) {
+        this.module!._free(ptr);
+    } 
+
+    createBufferPointers() {
+        this.renderBufferPointer = this.uint8ArrayToPointer(this.renderBuffer.values);
+        this.depthBufferPointer = this.float64ArrayToPointer(this.depthBuffer.values);
+    }
+
+    clearRenderBufferWasm() {
+        if (!this.renderBufferPointer) return;
+        this.module!.clearRenderBuffer(this.renderBufferPointer!, 0, this.width, this.height);
+    }
+
+    initializeWasm(): Promise<void> {
+        return new Promise((resolve, reject) => {
+            const moduleArgs = {
+                onRuntimeInitialized: () => {
+                    console.log("wasm initialized")
+                },
+                print: (text: any) => {
+                    console.log('c++: ' + text);
+                },
+                // Add other configurations like canvas, wasmBinary, etc. as needed
+                // canvas: document.getElementById('my-canvas')
+            };
+
+            MainModuleFactory(moduleArgs).then((Module: any) => {
+                this.module = Module;
+                resolve();
+            });
+        });
     }
 }

@@ -2,8 +2,9 @@ import './style.css'
 import {Buffer} from "./Buffer.ts";
 import {Rasterizer} from "./Rasterizer/Rasterizer.ts";
 import {Mesh} from "./Rasterizer/Mesh.ts";
-import {add, dot, fromF64, norm, sub, Vector} from "./Math/Vector.ts";
+import {add, mul, dot, fromF64, norm, sub, Vector} from "./Math/Vector.ts";
 import {Camera} from "./Rasterizer/Camera.ts";
+import { stone } from "./textures.ts";
 
 // sets color to the first face attribute and applies some simple lighting from above and to the right
 function testShader(output: Float64Array, position: Vector, faceAttriubutes: Float64Array[], _vertexAttributes: Float64Array[], globals: Float64Array[]) {
@@ -45,13 +46,75 @@ function testShader(output: Float64Array, position: Vector, faceAttriubutes: Flo
     output[3] = 1
 }
 
+function vertexColorShader(output: Float64Array, position: Vector, faceAttriubutes: Float64Array[], vertexAttributes: Float64Array[], globals: Float64Array[]) {
+    const color = vertexAttributes[0];
+
+    output[0] = color[0];
+    output[1] = color[1];
+    output[2] = color[2];
+    output[3] = 1;
+}
+
+function normalsShader(output: Float64Array, position: Vector, faceAttriubutes: Float64Array[], vertexAttributes: Float64Array[], globals: Float64Array[]) {
+    let normal = faceAttriubutes[0];
+    output[0] = (normal[0] + 1) / 2;
+    output[1] = (normal[1] + 1) / 2;
+    output[2] = (normal[2] + 1) / 2;
+    output[3] = 1;
+}
+
+function colorLerp(colorA: Vector, colorB: Vector, amount: number, output: Vector) {
+    if (amount < 0) amount = 0;
+    if (amount > 1) amount = 1;
+    output[0] = (colorB[0] - colorA[0]) * amount + colorA[0];
+    output[1] = (colorB[1] - colorA[1]) * amount + colorA[1];
+    output[0] = (colorB[2] - colorA[2]) * amount + colorA[2];
+}
+
+const blue: Vector = [0.1, 0.3, 0.95];
+const red: Vector = [0.85, 0.1, 0.35];
+const green: Vector = [0.05, 1, 0.25]
+
+function texturesShader(output: Uint8ClampedArray, position: Vector, faceAttriubutes: Float64Array[], vertexAttributes: Float64Array[], globals: Float64Array[]) {
+    const textureCoord = vertexAttributes[0];
+    const normal = fromF64(faceAttriubutes[0]);
+    sampleTexture(stone, 512, 512, textureCoord[0], textureCoord[1], output);
+
+    const lightDirection: Vector = [0, 1, -1];
+    let brightness = (dot(lightDirection, normal) + 1) / 2;
+    brightness = (brightness + 0.6) / 1.6;
+
+
+    output[0] *= brightness;
+    output[1] *= brightness;
+    output[2] *= brightness;
+    // output[3] = 255;
+}
+
+function sampleTexture(texture: Float64Array, width: number, height: number, x: number, y: number, output: Uint8ClampedArray) {
+    x = Math.floor(x * width);
+    y = Math.floor(y * height);
+
+    // loop them between 0-1
+    x = Math.abs(x % width);
+    y = Math.abs(y % height);
+
+    let index = y * width * 4 + x * 4;
+    output[0] = texture[index] * 255;
+    output[1] = texture[index + 1] * 255;
+    output[2] = texture[index + 2] * 255;
+    output[3] = 255;
+}
+
 // renders a buffer with dims = 4 to a canvas context
 function renderBuffer(buffer: Buffer, context: CanvasRenderingContext2D) {
     const imageData = context.getImageData(0, 0, buffer.width, buffer.height);
 
-    for (let i = 0; i < imageData.data.length; i++) {
-        imageData.data[i] = Math.max(Math.min(buffer.values[i] * 255, 255), 0);
-    }
+    // const dataLength = imageData.data.length;
+    // for (let i = 0; i < dataLength; i++) {
+    //     imageData.data[i] = Math.max(Math.min(buffer.values[i] * 255, 255), 0);
+    // }
+    imageData.data.set(buffer.values)
 
     context.putImageData(imageData, 0, 0);
 }
@@ -80,148 +143,118 @@ function generateMovementVector(theta: number, movementSpeed: number): Vector {
     return vec;
 }
 
-window.onload = function () {
+// credit to https://dbaron.org/log/20100309-faster-timeouts
+(function() {
+    var timeouts: (() => void)[] = [];
+    var messageName = "zero-timeout-message";
+
+    // Like setTimeout, but only takes a function argument.  There's
+    // no time argument (always zero) and no arguments (you have to
+    // use a closure).
+    function setZeroTimeout(fn: () => void) {
+        timeouts.push(fn);
+        window.postMessage(messageName, "*");
+    }
+
+    function handleMessage(event: MessageEvent) {
+        if (event.source == window && event.data == messageName) {
+            event.stopPropagation();
+            if (timeouts.length > 0) {
+                var fn = timeouts.shift()!;
+                fn();
+            }
+        }
+    }
+
+    window.addEventListener("message", handleMessage, true);
+
+    // Add the one thing we want added to the window object.
+    // @ts-ignore
+    window.setZeroTimeout = setZeroTimeout;
+})();
+
+window.onload = async function () {
     let canvas: HTMLCanvasElement | null = document.getElementById("canvas") as (HTMLCanvasElement | null);
     if (!canvas) return;
 
-    const width = 300;
-    const height = 200;
+    const width = 600;
+    const height = 400;
 
     canvas.width = width;
     canvas.height = height;
 
-    let ctx = canvas.getContext("2d")
+    let ctx = canvas.getContext("2d", {
+        willReadFrequently: true,
+    });
     if (!ctx) return;
 
-    const keys: {[key: string]: boolean} = {};
+    const keys: {[key: string]: boolean} = {}
+
+    const rasterizer = new Rasterizer(width, height);
+    await rasterizer.initializeWasm();
+    rasterizer.createBufferPointers();
 
     const loopContext = {
         ctx,
         lastRunTime: new Date().getTime(),
         fpsDisplay: document.getElementById("fps"),
-        rasterizer: new Rasterizer(width, height),
-        camera: new Camera(70, 0.1, 1000),
+        rasterizer: rasterizer,
+        camera: new Camera(85, width / height, 0.1, 1000),
         renderBuffer: new Buffer(width, height, 4),
         position: [0, 0, -10],
         rotation: [0, 0, 0],
-        rotationSpeed: 0.05,
-        movementSpeed: 0.1,
+        rotationSpeed: 0.003,
+        movementSpeed: 0.01,
+        lastRun: performance.now(),
         animate: function () {
             ctx.clearRect(0, 0, width, height);
             this.rasterizer.clear();
 
-            // const vertices: Vector[] = [
-            //     [-1, -1, 0],
-            //     [1, -1, 0],
-            //     [0, 1, 0]
-            // ];
-            //
-            // const faces: number[][] = [
-            //     [0, 1, 2]
-            // ];
-            //
-            // const faceAttributes: Float64Array[][] = [];
-            // const vertexAttributes: Float64Array[][] = [
-            //     [
-            //         new Float64Array([0.8, 0.1, 0.1]),
-            //         new Float64Array([0.1, 0.8, 0.1]),
-            //         new Float64Array([0.1, 0.1, 0.8])
-            //     ]
-            // ];
-
-            // defines vertices and faces of our cube
-            const vertices: Vector[] = [
-                [-1, -1, -1],
-                [1, -1, -1],
-                [1, 1, -1],
-                [-1, 1, -1],
-                [-1, -1, 1],
-                [1, -1, 1],
-                [1, 1, 1],
-                [-1, 1, 1],
+            const pyramidVertices: Vector[] = [
+                [-1, 0, -1],
+                [ 1, 0, -1],
+                [ 1, 0,  1],
+                [-1, 0,  1],
+                [ 0, 2,  0],
+                [ 0, 2,  0],
+                [ 0, 2,  0],
+                [ 0, 2,  0]
             ]
 
-            let faces: number[][] = [
-                [1, 3, 2], // back
-                [1, 0, 3],
-                [0, 4, 7], // left
-                [0, 7, 3],
-                [5, 1, 2], // right
-                [5, 2, 6],
-                [7, 6, 2], // top
-                [7, 2, 3],
-                [0, 1, 5], // bottom
-                [0, 5, 4],
-                [4, 5, 6], // front
-                [4, 6, 7],
+            const pyramidFaces: number[][] = [
+                [3, 1, 0], // bottom
+                [2, 1, 3],
+                [0, 1, 4], // back
+                [1, 2, 5], // right
+                [2, 3, 6], // front
+                [3, 0, 7], // left
             ]
 
-            let faceColors: Float64Array[] =  [
-                new Float64Array([0.8, 0.1, 0.1]), // back - red
-                new Float64Array([0.8, 0.1, 0.1]),
-                new Float64Array([0.1, 0.1, 0.8]), // left - blue
-                new Float64Array([0.1, 0.1, 0.8]),
-                new Float64Array([0.1, 0.8, 0.1]), // right - green
-                new Float64Array([0.1, 0.8, 0.1]),
-                new Float64Array([0.8, 0.1, 0.8]), // top - purple
-                new Float64Array([0.8, 0.1, 0.8]),
-                new Float64Array([0.8, 0.8, 0.1]), // bottom - yellow
-                new Float64Array([0.8, 0.8, 0.1]),
-                new Float64Array([0.1, 0.8, 0.8]), // front - cyan
-                new Float64Array([0.1, 0.8, 0.8])
+            const vertexTextureCoords: Float64Array[] = [
+                new Float64Array([0, 0]),
+                new Float64Array([2, 0]),
+                new Float64Array([2, 2]),
+                new Float64Array([0, 2]),
+                new Float64Array([1, 2]), // back
+                new Float64Array([0, 1]), // right
+                new Float64Array([1, 0]), // front
+                new Float64Array([2, 1]), // left
             ]
 
-            const mesh = new Mesh(vertices, faces)
-            const t = new Date().getTime() / 10000 * Math.PI * 2;
-            mesh.translate(0, Math.sin(t) * 2, 5)
-            mesh.rotate(0, t, 0)
-            mesh.rotate(t / 3, 0, 0);
+            const pyramidMesh = new Mesh(pyramidVertices, pyramidFaces);
+            pyramidMesh.addFaceAttribute(pyramidMesh.calculateNormals(false));
+            pyramidMesh.addVertexAttribute(vertexTextureCoords);
+            pyramidMesh.translate(-1, -2, 5)
 
-            //
-            // [10, 10, 10] [0.4, 0.4, 0.4]
-            const pointLightLocations: Vector[] = [[0, 0, 3.5]];
-            const pointLightColors: number[][] = [[0.9, 0.9, 0.9]];
-            const pointLights = createPointLights(this.camera, pointLightLocations, pointLightColors);
-            const ambientLight = new Float64Array([0.25, 0.25, 0.25]);
-
-            mesh.addFaceAttribute(faceColors);
-            mesh.addFaceAttribute(mesh.calculateNormals(this.camera,false));
-            mesh.addGlobal(pointLights)
-            mesh.addGlobal(ambientLight) // ambient light
-            this.rasterizer.render(mesh, this.camera, testShader)
-
-            const groundVertices: Vector[] = [
-                [-10, 0, -10],
-                [10, 0, -10],
-                [10, 0, 10],
-                [-10, 0, 10],
-            ]
-
-            const groundFaces = [
-                [3, 0, 1],
-                [3, 1, 2]
-            ]
-
-            const groundColors = [
-                new Float64Array([0.85, 0.85, 0.85]),
-                new Float64Array([0.85, 0.85, 0.85]),
-            ]
-
-            const ground = new Mesh(groundVertices, groundFaces);
-            ground.translate(0, -4, 0);
-
-            ground.addFaceAttribute(groundColors);
-            ground.addFaceAttribute(ground.calculateNormals(this.camera, false));
-            ground.addGlobal(pointLights);
-            ground.addGlobal(ambientLight);
-            this.rasterizer.render(ground, this.camera, testShader)
-
+            // this.rasterizer.render(pyramidMesh, this.camera, texturesShader);
+            this.rasterizer.renderWasm(pyramidMesh, this.camera);
             renderBuffer(this.rasterizer.renderBuffer, this.ctx);
+
 
             // framerate calculation and display code
             if (!this.fpsDisplay) return;
 
-            const now = new Date().getTime();
+            const now = performance.now();
             const delta = now - this.lastRunTime;
             const fps = 1000 / delta
             this.fpsDisplay.innerHTML = `FPS: ${Math.round(fps)}`
@@ -229,39 +262,39 @@ window.onload = function () {
 
             // movement
             if (keys["ArrowLeft"]) {
-                this.rotation[1] += this.rotationSpeed;
+                this.rotation[1] += this.rotationSpeed * delta;
             }
 
             if (keys["ArrowRight"]) {
-                this.rotation[1] -= this.rotationSpeed;
+                this.rotation[1] -= this.rotationSpeed * delta;
             }
 
             if (keys["KeyW"]) {
                 const movementVector = generateMovementVector(this.rotation[1], this.movementSpeed);
-                this.position = add(this.position as Vector, movementVector);
+                this.position = add(this.position as Vector, mul(movementVector, delta));
             }
 
             if (keys["KeyS"]) {
                 const movementVector = generateMovementVector(this.rotation[1] + Math.PI, this.movementSpeed);
-                this.position = add(this.position as Vector, movementVector);
+                this.position = add(this.position as Vector, mul(movementVector, delta));
             }
 
             if (keys["KeyA"]) {
                 const movementVector = generateMovementVector(this.rotation[1] + Math.PI / 2, this.movementSpeed);
-                this.position = add(this.position as Vector, movementVector);
+                this.position = add(this.position as Vector, mul(movementVector, delta));
             }
 
             if (keys["KeyD"]) {
                 const movementVector = generateMovementVector(this.rotation[1] + Math.PI * 3 / 2, this.movementSpeed);
-                this.position = add(this.position as Vector, movementVector);
+                this.position = add(this.position as Vector, mul(movementVector, delta));
             }
 
             if (keys["Space"]) {
-                this.position[1] += this.movementSpeed
+                this.position[1] += this.movementSpeed * delta
             }
 
             if (keys["ShiftLeft"]) {
-                this.position[1] -= this.movementSpeed;
+                this.position[1] -= this.movementSpeed * delta;
             }
 
             this.rotation[0] = Math.max(Math.min(this.rotation[0], Math.PI / 2), -Math.PI / 2)
@@ -269,11 +302,12 @@ window.onload = function () {
             this.camera.position = this.position as Vector;
             this.camera.rotation = this.rotation as Vector;
 
-            requestAnimationFrame(this.animate.bind(this));
+            // @ts-ignore
+            window.setZeroTimeout(loopContext.animate.bind(loopContext));
         }
-    }
+    };
 
-    loopContext.animate()
+    loopContext.animate();
 
     // movement
     document.body.addEventListener("keydown", (e) => {

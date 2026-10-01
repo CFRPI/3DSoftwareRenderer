@@ -84,7 +84,7 @@ export class Mesh {
 
      Normals are relative to camera and will be automatically transformed by the camera
     */
-    calculateNormals(camera: Camera, invert: boolean): Float64Array[] {
+    calculateNormals(invert: boolean): Float64Array[] {
         let normals: Vector[] = [];
 
         for (let face of this.faces) {
@@ -101,7 +101,7 @@ export class Mesh {
             normals.push(normalVector)
         }
 
-        normals = camera.transformDirectionVectors(normals);
+        // normals = camera.transformDirectionVectors(normals);
 
         return normals.map(normal => toF64(normal));
     }

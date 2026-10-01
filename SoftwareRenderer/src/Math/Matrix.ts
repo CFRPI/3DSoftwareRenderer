@@ -87,7 +87,7 @@ export class Matrices {
     }
 
     // perspective projection matrix
-    static Perspective(fov: number, near: number, far: number): Matrix {
+    static Perspective(fov: number, aspect: number, near: number, far: number): Matrix {
         let matrixValues: number[][] = [];
 
         for (let a = 0; a < 4; a++) {
@@ -98,7 +98,7 @@ export class Matrices {
         }
 
         const scale = 1 / Math.tan(fov / 2 * Math.PI / 180);
-        matrixValues[0][0] = -scale; // set it negative to flip x's back to the right position
+        matrixValues[0][0] = -scale / aspect; // set it negative to flip x's back to the right position
         matrixValues[1][1] = scale;
         matrixValues[2][2] = -far / (far - near);
         matrixValues[3][2] = far * near / (far - near);

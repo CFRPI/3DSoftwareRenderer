@@ -1,3 +1,9 @@
+support/out.png
+support/stone.png
+.DS_Store
+c_cpp_properties.json
+temp.ts
+
 # Logs
 logs
 *.log
@@ -22,3 +28,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+support/*.png
+.DS_Store
+SoftwareRenderer/wasm/build/*
