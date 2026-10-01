@@ -10,7 +10,7 @@ bun dev
 ```
 
 ## What is it?
-It is my attempt at replicating (at least part of) the 3d graphics pipeline purely on the cpu, it is not meant for practical use, it is far too slow, it is primarily to help me learn and for fun.
+It is my attempt at replicating (at least part of) the 3d graphics pipeline purely on the cpu, it is not meant for practical use, it is far too slow, it is primarily to help me learn and for fun. It features an alternate renderer written in webassembly for increased performance.
 
 ## Resources/Credit
 - I relied heavily on [scratchapixel](scratchapixel.com) to learn how to do perspective division, rasterization, and vertex attributes
@@ -20,8 +20,6 @@ It is my attempt at replicating (at least part of) the 3d graphics pipeline pure
 - I recommend [wikipedia barycentric coordinates](https://en.wikipedia.org/wiki/Barycentric_coordinate_system) 
 - The current version of Rasterizer class triangleContains is written by claude
   
-## Future
-This project is not complete, I want to load some interesting models and clean up the code, A branch is in development with an alternate renderer written in webassembly.
 
 ## Images
 Basic Triangle
